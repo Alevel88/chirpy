@@ -1,0 +1,5 @@
+# Ignorar archivo de variables de entorno
+.env
+
+# Ignorar archivo de tips
+Tips.txt
