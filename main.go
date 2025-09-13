@@ -8,16 +8,18 @@ import (
 	"strings"
 	"sync/atomic"
 	 _ "github.com/lib/pq"	
-	 //"github.com/google/uuid"
+	 "github.com/google/uuid"
 	 "github.com/joho/godotenv"
 	 "database/sql"
 	 "os"
 	 "github.com/bootdotdev/learn-http-servers/internal/database"
+	 "time"
 )
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
     db *database.Queries	
+	platform string
 }
 
 type chirpRequest struct {
@@ -30,6 +32,17 @@ type errorResponse struct {
 
 type cleanedResponse struct {
 	CleanedBody string `json:"cleaned_body"`
+}
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
+
+type reqCreateUser struct {
+	Email     string    `json:"email"`
 }
 
 func main() {
@@ -50,7 +63,10 @@ func main() {
 	dbQueries := database.New(db)
 
 		// after creating dbQueries:
-	apiCfg := &apiConfig{db: dbQueries}
+	apiCfg := &apiConfig{
+		db:       dbQueries,
+		platform: os.Getenv("PLATFORM"),
+	}
 
 //	apiCfg := &apiConfig{}
 
@@ -78,6 +94,9 @@ func main() {
 
 	// 5. Chirp validation + cleaning
 	mux.HandleFunc("POST /api/validate_chirp", apiCfg.handlerValidateChirp)
+	
+	// 6. Get user
+	mux.HandleFunc("POST /api/users", apiCfg.handlerUsersCreate)
 
 	// Server setup
 	srv := &http.Server{
@@ -116,8 +135,21 @@ func (cfg *apiConfig) handlerAdminMetrics(w http.ResponseWriter, r *http.Request
 
 // Handler para /admin/reset
 func (cfg *apiConfig) handlerAdminReset(w http.ResponseWriter, r *http.Request) {
+	// in the reset handler:
+	if cfg.platform != "dev" {
+		respondWithError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+
+	err := cfg.db.DeleteUsers(r.Context())
+  	if err != nil {
+        respondWithError(w, http.StatusInternalServerError, "could not delete users")
+        return
+	} 	
+
 	cfg.fileserverHits.Store(0)
 	w.WriteHeader(http.StatusOK)
+
 }
 
 // Handler para /api/validate_chirp
@@ -135,6 +167,36 @@ func (cfg *apiConfig) handlerValidateChirp(w http.ResponseWriter, r *http.Reques
 
 	cleaned := cleanChirp(req.Body)
 	respondWithJSON(w, http.StatusOK, cleanedResponse{CleanedBody: cleaned})
+}
+
+// Handler para /api/users
+func (cfg *apiConfig) handlerUsersCreate(w http.ResponseWriter, r *http.Request) {
+	var req reqCreateUser
+	var res User
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondWithError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+
+	if strings.TrimSpace(req.Email) == ""{
+		respondWithError(w, http.StatusBadRequest, "email required")
+        return
+	}
+
+    dbUser, err := cfg.db.CreateUser(r.Context(), req.Email)
+    if err != nil {
+        respondWithError(w, http.StatusInternalServerError, "could not create user")
+        return
+    }
+
+	res = User{ID: dbUser.ID, 
+			    CreatedAt: dbUser.CreatedAt, 
+				UpdatedAt: dbUser.UpdatedAt, 
+				Email: dbUser.Email}
+
+	respondWithJSON(w, http.StatusCreated, res)
+
 }
 
 // --- helpers ---
