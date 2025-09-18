@@ -22,16 +22,17 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
     db *database.Queries	
 	platform string
+	secret string
 }
 
 type chirpRequest struct {
 	Body string `json:"body"`
-	User_id string `json:"user_id"`
 }
 
 type loginRequest struct {
 	Password string `json:"password"`
 	Email string `json:"email"`
+	Expires_in_seconds *int `json:"expires_in_seconds"`
 }
 
 type errorResponse struct {
@@ -47,6 +48,7 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	Token     string    `json:"token"`
 }
 
 type reqCreateUser struct {
@@ -83,6 +85,7 @@ func main() {
 	apiCfg := &apiConfig{
 		db:       dbQueries,
 		platform: os.Getenv("PLATFORM"),
+		secret:   os.Getenv("SECRET"),
 	}
 
 //	apiCfg := &apiConfig{}
@@ -230,28 +233,37 @@ func (cfg *apiConfig) handlerUsersCreate(w http.ResponseWriter, r *http.Request)
 
 // Handler para /api/chirps
 func (cfg *apiConfig) handlerChirps(w http.ResponseWriter, r *http.Request) {
+	// Buscamos el bearer si lo tiene
+	tokenStr, err := auth.GetBearerToken(r.Header)
+    if err != nil {
+        respondWithError(w, http.StatusUnauthorized, "unauthorized")
+        return
+    }
+
+	// Validamos el JWT y obtenemos el user
+    userId, err := auth.ValidateJWT(tokenStr, cfg.secret)
+    if err != nil {
+        respondWithError(w, http.StatusUnauthorized, "unauthorized")
+        return
+    }
+
+	// Leemos la peticion para recupera el chirp
 	var req chirpRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondWithError(w, http.StatusBadRequest, "Something went wrong")
 		return
 	}
-
+	// Validamos el largo del chirp
 	if len(req.Body) > 140 {
 		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
 		return
 	}
-
-	uid, err := uuid.Parse(req.User_id)
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "invalid user_id")
-		return
-	}
-
+	// Parametros para SQL
 	params := database.CreateChirpParams{
 		Body:   cleanChirp(req.Body),
-		UserID: uid, 
+		UserID: userId, 
 	}
-
+	// Se crea el registro en la DB. 
 	dbChirp, err := cfg.db.CreateChirp(r.Context(), params)
     if err != nil {
         respondWithError(w, http.StatusInternalServerError, "could not create chirp")
@@ -331,6 +343,7 @@ func (cfg *apiConfig) handlerGetChirpById(w http.ResponseWriter, r *http.Request
 func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	var res User
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondWithError(w, http.StatusBadRequest, "Something went wrong")
 		return
@@ -353,11 +366,26 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
         return
 	}
+	// Declaramos el default
+	expires := 3600
+	if req.Expires_in_seconds != nil {
+		if *req.Expires_in_seconds < 3600 {
+			expires = *req.Expires_in_seconds
+		}
+	}
+
+	// Buscamos el token en el AUTH 
+	token, err := auth.MakeJWT(dbUser.ID, cfg.secret, time.Duration(expires)*time.Second)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
+        return
+	}
 
 	res = User{ID: dbUser.ID, 
 			   CreatedAt: dbUser.CreatedAt, 
 			   UpdatedAt: dbUser.UpdatedAt, 
-			   Email: dbUser.Email}
+			   Email: dbUser.Email,
+			   Token: token }
 
 	respondWithJSON(w, http.StatusOK, res)
 }

@@ -7,6 +7,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"time"
 	"errors"
+	"net/http"
+	"strings"
 )
 
 
@@ -68,4 +70,28 @@ func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error){
 
 	return userID, nil
 
+}
+
+func GetBearerToken(headers http.Header) (string, error){
+	authHeader := headers.Get("Authorization")
+	if authHeader == "" {
+		return "", errors.New("Auth error")
+	}
+
+	// Normalizamos (case-insensitive) y eliminamos espacios
+	authHeader = strings.TrimSpace(authHeader)
+
+	// Revisamos si empieza con "Bearer "
+	const prefix = "Bearer "
+	if len(authHeader) < len(prefix) || !strings.EqualFold(authHeader[:len(prefix)], prefix) {
+		return "", errors.New("invalid authorization header")
+	}
+
+	// Sacamos el prefijo y espacios sobrantes
+	token := strings.TrimSpace(authHeader[len(prefix):])
+	if token == "" {
+		return "", errors.New("empty bearer token")
+	}
+
+	return token, nil
 }
