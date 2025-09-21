@@ -32,7 +32,6 @@ type chirpRequest struct {
 type loginRequest struct {
 	Password string `json:"password"`
 	Email string `json:"email"`
-	Expires_in_seconds *int `json:"expires_in_seconds"`
 }
 
 type errorResponse struct {
@@ -49,6 +48,7 @@ type User struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
 	Token     string    `json:"token"`
+	RefreshToken string `json:"refresh_token"`
 }
 
 type reqCreateUser struct {
@@ -62,6 +62,11 @@ type chirpResponse struct {
     UpdatedAt time.Time `json:"updated_at"`
     Body      string    `json:"body"`
     UserID    uuid.UUID `json:"user_id"`
+}
+
+type reqUpdateUser struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
 
 func main() {
@@ -129,7 +134,12 @@ func main() {
 
 	// 10. Login
 	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
-	
+	// 11. Handlers para el refresh token
+	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
+	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
+	//11. Update user
+	mux.HandleFunc("PUT /api/users", apiCfg.handlerUsersUpdate)
+
 	// Server setup
 	srv := &http.Server{
 		Addr:    ":" + port,
@@ -366,30 +376,175 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
         return
 	}
-	// Declaramos el default
-	expires := 3600
-	if req.Expires_in_seconds != nil {
-		if *req.Expires_in_seconds < 3600 {
-			expires = *req.Expires_in_seconds
-		}
+	
+	// Buscamos el token en el AUTH 
+	token, err := auth.MakeJWT(dbUser.ID, cfg.secret, time.Hour)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "could not create token")
+        return
 	}
 
-	// Buscamos el token en el AUTH 
-	token, err := auth.MakeJWT(dbUser.ID, cfg.secret, time.Duration(expires)*time.Second)
+	// Parseamos el token random  
+	refreshToken, err := auth.MakeRefreshToken()
 	if err != nil {
-		respondWithError(w, http.StatusUnauthorized, "Incorrect email or password")
-        return
+		respondWithError(w, http.StatusInternalServerError, "could not create refresh token")
+		return
+	}
+
+	// se vence en 60 dias
+	refreshExpiresAt := time.Now().Add(24 * time.Hour * 60)
+
+	// Parametros para crear
+	createParams := database.CreateTokenParams{
+		Token:     refreshToken,
+		UserID:    dbUser.ID,
+		ExpiresAt: refreshExpiresAt,
+	}
+
+	// Guardamos el token en BD
+	dbRefreshToken, err := cfg.db.CreateToken(r.Context(), createParams)
+	if err != nil {
+		// If conflict on primary key (very unlikely), return error
+		respondWithError(w, http.StatusInternalServerError, "could not persist refresh token")
+		return
 	}
 
 	res = User{ID: dbUser.ID, 
 			   CreatedAt: dbUser.CreatedAt, 
 			   UpdatedAt: dbUser.UpdatedAt, 
 			   Email: dbUser.Email,
-			   Token: token }
+			   Token: token,
+			   RefreshToken: dbRefreshToken.Token }
 
 	respondWithJSON(w, http.StatusOK, res)
 }
 
+func (cfg *apiConfig) handlerRefresh(w http.ResponseWriter, r *http.Request) {
+	// get token from header
+	tokenStr, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	// lookup token in DB
+	row, err := cfg.db.GetUserFromRefreshToken(r.Context(), tokenStr)
+	if err != nil {
+		// not found or other error -> unauthorized
+		if errors.Is(err, sql.ErrNoRows) {
+			respondWithError(w, http.StatusUnauthorized, "invalid refresh token")
+			return
+		}
+		respondWithError(w, http.StatusInternalServerError, "could not lookup refresh token")
+		return
+	}
+
+	// Check revoked
+	if row.RevokedAt.Valid {
+		respondWithError(w, http.StatusUnauthorized, "refresh token revoked")
+		return
+	}
+
+	// Check expiry
+	if time.Now().UTC().After(row.ExpiresAt) {
+		respondWithError(w, http.StatusUnauthorized, "refresh token expired")
+		return
+	}
+
+	// row should include user id in whatever sqlc generated struct you have.
+	// I assume sqlc returned user's id as row.ID (because of SELECT users.id).
+	userID := row.ID
+
+	// Create new access token (1 hour)
+	newAccessToken, err := auth.MakeJWT(userID, cfg.secret, time.Hour)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "could not create access token")
+		return
+	}
+
+	resp := map[string]string{"token": newAccessToken}
+	respondWithJSON(w, http.StatusOK, resp)
+}
+
+func (cfg *apiConfig) handlerRevoke(w http.ResponseWriter, r *http.Request) {
+	tokenStr, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	// Update DB to revoke it
+	if err := cfg.db.RevokeToken(r.Context(), tokenStr); err != nil {
+		// If token not found, treat as 401 (or you could return 204 to avoid token probing)
+		if errors.Is(err, sql.ErrNoRows) {
+			respondWithError(w, http.StatusUnauthorized, "invalid refresh token")
+			return
+		}
+		respondWithError(w, http.StatusInternalServerError, "could not revoke token")
+		return
+	}
+
+	// Successful revoke — respond 204 No Content
+	w.WriteHeader(http.StatusNoContent)
+}
+
+
+func (cfg *apiConfig) handlerUsersUpdate(w http.ResponseWriter, r *http.Request) {
+	// 1. Obtener bearer token
+	tokenStr, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	// 2. Validar JWT y obtener el userID
+	userID, err := auth.ValidateJWT(tokenStr, cfg.secret)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	// 3. Parsear body
+	var req reqUpdateUser
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondWithError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+
+	if strings.TrimSpace(req.Email) == "" || strings.TrimSpace(req.Password) == "" {
+		respondWithError(w, http.StatusBadRequest, "email and password required")
+		return
+	}
+
+	// 4. Hashear password
+	hash, err := auth.HashPassword(req.Password)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "could not hash password")
+		return
+	}
+
+	// 5. Update en DB
+	params := database.UpdateUserParams{
+		ID:             userID,
+		Email:          req.Email,
+		HashedPassword: hash,
+	}
+
+	dbUser, err := cfg.db.UpdateUser(r.Context(), params)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "could not update user")
+		return
+	}
+
+	// 6. Responder (sin password)
+	res := User{
+		ID:        dbUser.ID,
+		CreatedAt: dbUser.CreatedAt,
+		UpdatedAt: dbUser.UpdatedAt,
+		Email:     dbUser.Email,
+	}
+	respondWithJSON(w, http.StatusOK, res)
+}
 
 // --- helpers ---
 
